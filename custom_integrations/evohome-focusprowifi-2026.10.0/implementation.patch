@@ -1,0 +1,627 @@
+diff --git a/homeassistant/components/evohome/climate.py b/homeassistant/components/evohome/climate.py
+--- a/homeassistant/components/evohome/climate.py
++++ b/homeassistant/components/evohome/climate.py
+@@ -37,7 +37,14 @@
+ 
+ from .const import DOMAIN, EVOHOME_DATA, RESET_BREAKS_IN_HA_VERSION, EvoService
+ from .coordinator import EvoDataUpdateCoordinator
+-from .entity import EvoChild, EvoEntity, is_valid_zone, unique_zone_id
++from .entity import (
++    EvoChild,
++    EvoEntity,
++    _recurse_and_revert,
++    is_schedule_free_focuspro,
++    is_valid_zone,
++    unique_zone_id,
++)
+ from .helpers import async_create_deprecation_issue_once
+ 
+ _LOGGER = logging.getLogger(__name__)
+@@ -84,6 +91,12 @@
+         tcs.location.name,
+         coordinator.loc_idx,
+     )
++
++    if is_schedule_free_focuspro(tcs):
++        focuspro = EvoFocusProWifi(coordinator, tcs)
++        async_add_entities([focuspro])
++        await focuspro.update_attrs()
++        return
+ 
+     entities: list[EvoController | EvoZone] = [EvoController(coordinator, tcs)]
+ 
+@@ -419,7 +432,7 @@
+ 
+     @property
+     @override
+-    def hvac_mode(self) -> HVACMode:
++    def hvac_mode(self) -> HVACMode | None:
+         """Return the current operating mode of a Controller."""
+         evo_mode = self._evo_device.mode
+         return (
+@@ -501,3 +514,102 @@
+     async def update_attrs(self) -> None:
+         """Update the entity's extra state attrs."""
+         self._handle_coordinator_update()
++
++
++class EvoFocusProWifi(EvoController):
++    """Combine mode and temperature controls for a schedule-free FocusPro."""
++
++    _attr_icon = "mdi:thermostat"
++
++    def __init__(
++        self, coordinator: EvoDataUpdateCoordinator, evo_device: evo.ControlSystem
++    ) -> None:
++        """Keep the controller identity used by the original FocusPro integration."""
++        super().__init__(coordinator, evo_device)
++        self._zone = evo_device.zones[0]
++        self._attr_supported_features = (
++            ClimateEntityFeature.TARGET_TEMPERATURE
++            | ClimateEntityFeature.TURN_OFF
++            | ClimateEntityFeature.TURN_ON
++        )
++        self._attr_hvac_modes = [
++            mode
++            for mode, evo_mode in (
++                (HVACMode.OFF, EvoSystemMode.OFF),
++                (HVACMode.HEAT, EvoSystemMode.HEAT),
++            )
++            if evo_mode in self._evo_modes
++        ]
++        self._attr_precision = self._zone.setpoint_capabilities["value_resolution"]
++        self._attr_target_temperature_step = self._attr_precision
++        self._attr_min_temp = self._zone.min_heat_setpoint
++        self._attr_max_temp = self._zone.max_heat_setpoint
++
++    @property
++    @override
++    def hvac_mode(self) -> HVACMode | None:
++        """Return the actual controller mode, independently of its setpoint."""
++        return {
++            EvoSystemMode.OFF: HVACMode.OFF,
++            EvoSystemMode.HEAT: HVACMode.HEAT,
++        }.get(self._evo_device.mode)
++
++    @property
++    @override
++    def current_temperature(self) -> float | None:
++        """Return the measured zone temperature when available."""
++        if self._zone.temperature is None:
++            return None
++        if (temperature := self.coordinator.temps.get(self._zone.id)) is not None:
++            return temperature
++        return self._zone.temperature
++
++    @property
++    @override
++    def target_temperature(self) -> float | None:
++        """Return the zone's heating setpoint."""
++        return self._zone.target_heat_temperature
++
++    @property
++    @override
++    def extra_state_attributes(self) -> dict[str, Any]:
++        """Expose controller and zone status together."""
++        status = dict(super().extra_state_attributes["status"])
++        status.update(
++            _recurse_and_revert(
++                {
++                    "zone_id": self._zone.id,
++                    "setpoint_status": self._zone.setpoint_status,
++                    "temperature_status": self._zone.temperature_status,
++                    "zone_active_faults": self._zone.active_faults,
++                }
++            )
++        )
++        return {"status": status}
++
++    @override
++    async def async_set_temperature(self, **kwargs: Any) -> None:
++        """Set a permanent temperature hold without requesting a schedule."""
++        await self.coordinator.call_client_api(
++            self._zone.set_temperature(kwargs[ATTR_TEMPERATURE], until=None)
++        )
++
++    @override
++    async def async_set_zone_override(
++        self, setpoint: float, duration: timedelta | None = None
++    ) -> None:
++        """Allow permanent holds and reject unsupported timed overrides."""
++        if duration is not None:
++            raise ServiceValidationError(
++                "This FocusPro thermostat does not support temporary overrides"
++            )
++        await self.async_set_temperature(
++            temperature=max(min(setpoint, self.max_temp), self.min_temp)
++        )
++
++    @override
++    async def async_clear_zone_override(self) -> None:
++        """Reject clearing a hold when there is no schedule to resume."""
++        raise ServiceValidationError(
++            "This FocusPro thermostat does not support following a schedule"
++        )
+diff --git a/homeassistant/components/evohome/entity.py b/homeassistant/components/evohome/entity.py
+--- a/homeassistant/components/evohome/entity.py
++++ b/homeassistant/components/evohome/entity.py
+@@ -11,6 +11,8 @@
+     SZ_SINCE,
+     SZ_TIME_UNTIL,
+     SZ_UNTIL,
++    TcsModelType as EvoTcsModelType,
++    ZoneMode as EvoZoneMode,
+     ZoneModelType as EvoZoneModelType,
+     ZoneType as EvoZoneType,
+ )
+@@ -23,6 +25,15 @@
+ from .coordinator import EvoDataUpdateCoordinator
+ 
+ _LOGGER = logging.getLogger(__name__)
++
++
++def is_schedule_free_focuspro(tcs: evo.ControlSystem) -> bool:
++    """Identify a single-zone FocusPro without schedule support."""
++    return (
++        tcs.model == EvoTcsModelType.FOCUS_PRO_WIFI_RETAIL
++        and len(tcs.zones) == 1
++        and EvoZoneMode.FOLLOW_SCHEDULE not in tcs.zones[0].allowed_modes
++    )
+ 
+ 
+ def _recurse_and_revert(val: Any, _key: str | None = None) -> Any:
+diff --git a/homeassistant/components/evohome/coordinator.py b/homeassistant/components/evohome/coordinator.py
+--- a/homeassistant/components/evohome/coordinator.py
++++ b/homeassistant/components/evohome/coordinator.py
+@@ -211,6 +211,8 @@
+ 
+     async def _update_v2_schedules(self) -> None:
+         for zone in self.tcs.zones:
++            if not zone.schedule_capabilities:
++                continue
+             try:
+                 await zone.get_schedule()
+             except ec2.InvalidScheduleError as err:
+diff --git a/homeassistant/components/evohome/button.py b/homeassistant/components/evohome/button.py
+--- a/homeassistant/components/evohome/button.py
++++ b/homeassistant/components/evohome/button.py
+@@ -13,7 +13,7 @@
+ 
+ from .const import EVOHOME_DATA
+ from .coordinator import EvoDataUpdateCoordinator
+-from .entity import is_valid_zone, unique_zone_id
++from .entity import is_schedule_free_focuspro, is_valid_zone, unique_zone_id
+ 
+ 
+ async def async_setup_platform(
+@@ -29,6 +29,9 @@
+ 
+     coordinator = hass.data[EVOHOME_DATA].coordinator
+     tcs = hass.data[EVOHOME_DATA].tcs
++
++    if is_schedule_free_focuspro(tcs):
++        return
+ 
+     entities: list[EvoResetButtonBase] = [EvoSystemResetButton(coordinator, tcs)]
+ 
+diff --git a/tests/components/evohome/test_focusprowifi.py b/tests/components/evohome/test_focusprowifi.py
+new file mode 100644
+--- /dev/null
++++ b/tests/components/evohome/test_focusprowifi.py
+@@ -0,0 +1,209 @@
++"""Test the schedule-free FocusProWifi thermostat from core PR #94805."""
++
++from unittest.mock import patch
++
++import pytest
++
++from homeassistant.components.climate import ClimateEntityFeature, HVACMode
++from homeassistant.components.evohome.const import EVOHOME_DATA
++from homeassistant.core import HomeAssistant
++from homeassistant.exceptions import ServiceValidationError
++from homeassistant.helpers import entity_registry as er
++from homeassistant.helpers.update_coordinator import UpdateFailed
++
++from .conftest import setup_evohome, user_locations_config_fixture
++
++
++async def test_focusprowifi_setup(
++    hass: HomeAssistant, config: dict[str, str], entity_registry: er.EntityRegistry
++) -> None:
++    """Keep one climate entity and never fetch unsupported schedules."""
++    with patch("evohomeasync2.zone.Zone.get_schedule") as get_schedule:
++        async for _ in setup_evohome(hass, config, install="focusprowifi"):
++            states = hass.states.async_all("climate")
++            assert len(states) == 1
++            state = states[0]
++            assert state.state == HVACMode.OFF
++            assert state.attributes["temperature"] == 23.0
++            assert state.attributes["current_temperature"] == 23.0
++            assert state.attributes["min_temp"] == 4.5
++            assert state.attributes["max_temp"] == 32.0
++            assert state.attributes["target_temp_step"] == 0.5
++            assert state.attributes["hvac_modes"] == [HVACMode.OFF, HVACMode.HEAT]
++            assert state.attributes["supported_features"] == (
++                ClimateEntityFeature.TARGET_TEMPERATURE
++                | ClimateEntityFeature.TURN_OFF
++                | ClimateEntityFeature.TURN_ON
++            )
++            await hass.data[EVOHOME_DATA].coordinator.async_refresh()
++            get_schedule.assert_not_awaited()
++            assert not hass.states.async_all("button")
++            assert entity_registry.async_get(state.entity_id).unique_id == "416856"
++
++
++@pytest.mark.parametrize(
++    ("service", "data", "mode"),
++    [
++        ("set_hvac_mode", {"hvac_mode": "heat"}, "heat"),
++        ("set_hvac_mode", {"hvac_mode": "off"}, "off"),
++        ("turn_on", {}, "heat"),
++        ("turn_off", {}, "off"),
++    ],
++)
++async def test_focusprowifi_mode_controls(
++    hass: HomeAssistant,
++    config: dict[str, str],
++    service: str,
++    data: dict[str, str],
++    mode: str,
++) -> None:
++    """Modern climate actions control the system, never a frost setpoint."""
++    async for _ in setup_evohome(hass, config, install="focusprowifi"):
++        entity = hass.states.async_all("climate")[0]
++        with (
++            patch("evohomeasync2.control_system.ControlSystem.set_mode") as set_mode,
++            patch("evohomeasync2.zone.Zone.set_temperature") as set_temperature,
++        ):
++            await hass.services.async_call(
++                "climate",
++                service,
++                {"entity_id": entity.entity_id, **data},
++                blocking=True,
++            )
++            set_mode.assert_awaited_once_with(mode, until=None)
++            set_temperature.assert_not_awaited()
++
++
++@pytest.mark.parametrize(
++    ("domain", "service", "data"),
++    [
++        ("climate", "set_temperature", {"temperature": 20.5}),
++        ("evohome", "set_zone_override", {"setpoint": 20.5}),
++    ],
++)
++async def test_focusprowifi_permanent_hold(
++    hass: HomeAssistant,
++    config: dict[str, str],
++    domain: str,
++    service: str,
++    data: dict[str, float],
++) -> None:
++    """Both temperature actions send permanent holds without schedule calls."""
++    with patch("evohomeasync2.zone.Zone.get_schedule") as get_schedule:
++        async for _ in setup_evohome(hass, config, install="focusprowifi"):
++            entity = hass.states.async_all("climate")[0]
++            with patch("evohomeasync2.zone.Zone.set_temperature") as set_temperature:
++                await hass.services.async_call(
++                    domain,
++                    service,
++                    {"entity_id": entity.entity_id, **data},
++                    blocking=True,
++                )
++                set_temperature.assert_awaited_once_with(20.5, until=None)
++            get_schedule.assert_not_awaited()
++
++
++@pytest.mark.parametrize("mode", ["Heat", "Off"])
++async def test_focusprowifi_system_service(
++    hass: HomeAssistant, config: dict[str, str], mode: str
++) -> None:
++    """The combined entity handles the integration's controller service."""
++    async for _ in setup_evohome(hass, config, install="focusprowifi"):
++        entity = hass.states.async_all("climate")[0]
++        with patch("evohomeasync2.control_system.ControlSystem.set_mode") as set_mode:
++            await hass.services.async_call(
++                "evohome",
++                "set_system_mode",
++                {"entity_id": entity.entity_id, "mode": mode},
++                blocking=True,
++            )
++            await hass.async_block_till_done()
++            set_mode.assert_awaited_once_with(mode.lower(), until=None)
++
++
++@pytest.mark.parametrize(
++    ("service", "data", "message"),
++    [
++        ("set_zone_override", {"setpoint": 20, "duration": 0}, "temporary overrides"),
++        ("set_zone_override", {"setpoint": 20, "duration": 60}, "temporary overrides"),
++        ("clear_zone_override", {}, "following a schedule"),
++    ],
++)
++async def test_focusprowifi_rejects_schedule_actions(
++    hass: HomeAssistant,
++    config: dict[str, str],
++    service: str,
++    data: dict[str, int],
++    message: str,
++) -> None:
++    """Unsupported schedule actions fail before issuing a vendor request."""
++    async for _ in setup_evohome(hass, config, install="focusprowifi"):
++        entity = hass.states.async_all("climate")[0]
++        with (
++            patch("evohomeasync2.zone.Zone.set_temperature") as set_temperature,
++            patch("evohomeasync2.zone.Zone.reset") as reset,
++            pytest.raises(ServiceValidationError, match=message),
++        ):
++            await hass.services.async_call(
++                "evohome",
++                service,
++                {"entity_id": entity.entity_id, **data},
++                blocking=True,
++            )
++        set_temperature.assert_not_awaited()
++        reset.assert_not_awaited()
++
++
++async def test_focusprowifi_state_refresh(
++    hass: HomeAssistant, config: dict[str, str]
++) -> None:
++    """Cloud status drives mode, temperatures, and unavailable measurements."""
++    async for _ in setup_evohome(hass, config, install="focusprowifi"):
++        coordinator = hass.data[EVOHOME_DATA].coordinator
++        entity = hass.states.async_all("climate")[0]
++        tcs = coordinator.tcs
++        zone = tcs.zones[0]
++        tcs.status["system_mode_status"]["mode"] = "heat"
++        zone.status["temperature_status"]["temperature"] = 21.5
++        zone.status["setpoint_status"]["target_heat_temperature"] = 20.5
++        coordinator.async_set_updated_data(coordinator.data)
++        state = hass.states.get(entity.entity_id)
++        assert state.state == HVACMode.HEAT
++        assert state.attributes["temperature"] == 20.5
++        assert state.attributes["current_temperature"] == 21.5
++        assert (
++            state.attributes["status"]["setpoint_status"]["target_heat_temperature"]
++            == 20.5
++        )
++
++        zone.status["temperature_status"]["is_available"] = False
++        coordinator.temps[zone.id] = 21.5
++        coordinator.async_set_updated_data(coordinator.data)
++        assert (
++            hass.states.get(entity.entity_id).attributes["current_temperature"] is None
++        )
++        coordinator.async_set_update_error(UpdateFailed("Cloud unavailable"))
++        assert hass.states.get(entity.entity_id).state == "unavailable"
++
++
++@pytest.mark.parametrize("available_modes", [["Off"], ["Off", "Heat"]])
++async def test_focusprowifi_supported_modes(
++    hass: HomeAssistant, config: dict[str, str], available_modes: list[str]
++) -> None:
++    """Advertise only HVAC modes actually supported by this thermostat."""
++    locations = user_locations_config_fixture("focusprowifi")
++    tcs = locations[0]["gateways"][0]["temperatureControlSystems"][0]
++    tcs["allowedSystemModes"] = [
++        mode
++        for mode in tcs["allowedSystemModes"]
++        if mode["systemMode"] in available_modes
++    ]
++    with patch(
++        "tests.components.evohome.conftest.user_locations_config_fixture",
++        return_value=locations,
++    ):
++        async for _ in setup_evohome(hass, config, install="focusprowifi"):
++            entity = hass.states.async_all("climate")[0]
++            assert entity.attributes["hvac_modes"] == [
++                mode.lower() for mode in available_modes
++            ]
+diff --git a/tests/components/evohome/test_focusprowifi_custom.py b/tests/components/evohome/test_focusprowifi_custom.py
+new file mode 100644
+--- /dev/null
++++ b/tests/components/evohome/test_focusprowifi_custom.py
+@@ -0,0 +1,66 @@
++"""Validate the installable custom integration through Home Assistant's loader."""
++
++import os
++from pathlib import Path
++from shutil import copytree
++from unittest.mock import patch
++
++import pytest
++
++from homeassistant.core import HomeAssistant
++from homeassistant.loader import async_get_integration
++from homeassistant.setup import async_setup_component
++
++from .conftest import mock_make_request, mock_post_request
++
++
++@pytest.mark.usefixtures("enable_custom_integrations")
++async def test_custom_focusprowifi(
++    hass: HomeAssistant, config: dict[str, str], tmp_path: Path
++) -> None:
++    """Load the shipped component and exercise mode and temperature actions."""
++    source = (
++        Path(
++            os.environ.get(
++                "EVOHOME_PACKAGE_ROOT", "/workspace/evohome-focusprowifi-2026.10.0"
++            )
++        )
++        / "custom_components/evohome"
++    )
++    hass.config.config_dir = str(tmp_path)
++    await hass.async_add_executor_job(
++        copytree, source, hass.config.path("custom_components/evohome")
++    )
++    with (
++        patch(
++            "evohomeasync2.auth.CredentialsManagerBase._post_request",
++            mock_post_request("focusprowifi"),
++        ),
++        patch(
++            "_evohome.auth.AbstractAuth._make_request",
++            mock_make_request("focusprowifi"),
++        ),
++        patch("evohomeasync2.zone.Zone.get_schedule") as get_schedule,
++    ):
++        integration = await async_get_integration(hass, "evohome")
++        assert integration.pkg_path == "custom_components.evohome"
++        assert integration.version == "2026.10.0.1"
++        assert await async_setup_component(hass, "evohome", {"evohome": config})
++        await hass.async_block_till_done()
++        states = hass.states.async_all("climate")
++        assert len(states) == 1
++        assert states[0].attributes["temperature"] == 23.0
++        with patch("evohomeasync2.zone.Zone.set_temperature") as set_temperature:
++            await hass.services.async_call(
++                "climate",
++                "set_temperature",
++                {"entity_id": states[0].entity_id, "temperature": 20.5},
++                blocking=True,
++            )
++            set_temperature.assert_awaited_once_with(20.5, until=None)
++        with patch("evohomeasync2.control_system.ControlSystem.set_mode") as set_mode:
++            await hass.services.async_call(
++                "climate", "turn_on", {"entity_id": states[0].entity_id}, blocking=True
++            )
++            set_mode.assert_awaited_once_with("heat", until=None)
++        get_schedule.assert_not_awaited()
+diff --git a/tests/components/evohome/fixtures/focusprowifi/user_locations.json b/tests/components/evohome/fixtures/focusprowifi/user_locations.json
+new file mode 100644
+--- /dev/null
++++ b/tests/components/evohome/fixtures/focusprowifi/user_locations.json
+@@ -0,0 +1,88 @@
++[
++  {
++    "locationInfo": {
++      "locationId": "111111",
++      "name": "My Home",
++      "streetAddress": "1 Main Street",
++      "city": "Melbourne",
++      "country": "Australia",
++      "postcode": "E1 1AA",
++      "locationType": "Residential",
++      "useDaylightSaveSwitching": true,
++      "timeZone": {
++        "timeZoneId": "AUSEasternStandardTime",
++        "displayName": "(UTC+10:00) Canberra, Melbourne, Sydney",
++        "offsetMinutes": 600,
++        "currentOffsetMinutes": 660,
++        "supportsDaylightSaving": true
++      },
++      "locationOwner": {
++        "userId": "2263181",
++        "username": "user_2263181@gmail.com",
++        "firstname": "John",
++        "lastname": "Smith"
++      }
++    },
++    "gateways": [
++      {
++        "gatewayInfo": {
++          "gatewayId": "222222",
++          "mac": "00D02DEE0000",
++          "crc": "1234",
++          "isWiFi": false
++        },
++        "temperatureControlSystems": [
++          {
++            "systemId": "416856",
++            "modelType": "FocusProWifiRetail",
++            "zones": [
++              {
++                "zoneId": "416856",
++                "modelType": "FocusProWifiRetail",
++                "setpointCapabilities": {
++                  "vacationHoldCapabilities": {
++                    "isChangeable": false,
++                    "isCancelable": false
++                  },
++                  "maxHeatSetpoint": 32.0,
++                  "minHeatSetpoint": 4.5,
++                  "valueResolution": 0.5,
++                  "canControlHeat": true,
++                  "canControlCool": false,
++                  "allowedSetpointModes": [
++                    "PermanentOverride",
++                    "VacationHold"
++                  ],
++                  "maxDuration": "1.00:00:00",
++                  "timingResolution": "00:15:00"
++                },
++                "name": "THERMOSTAT",
++                "zoneType": "Thermostat",
++                "allowedFanModes": [
++                  {
++                    "fanMode": "Auto"
++                  },
++                  {
++                    "fanMode": "On"
++                  }
++                ]
++              }
++            ],
++            "allowedSystemModes": [
++              {
++                "systemMode": "Off",
++                "canBePermanent": true,
++                "canBeTemporary": false
++              },
++              {
++                "systemMode": "Heat",
++                "canBePermanent": true,
++                "canBeTemporary": false
++              }
++            ]
++          }
++        ]
++      }
++    ]
++  }
++]
+diff --git a/tests/components/evohome/fixtures/focusprowifi/status_111111.json b/tests/components/evohome/fixtures/focusprowifi/status_111111.json
+new file mode 100644
+--- /dev/null
++++ b/tests/components/evohome/fixtures/focusprowifi/status_111111.json
+@@ -0,0 +1,38 @@
++{
++  "locationId": "111111",
++  "gateways": [
++    {
++      "gatewayId": "222222",
++      "temperatureControlSystems": [
++        {
++          "systemId": "416856",
++          "zones": [
++            {
++              "zoneId": "416856",
++              "temperatureStatus": {
++                "temperature": 23.0,
++                "isAvailable": true
++              },
++              "activeFaults": [],
++              "setpointStatus": {
++                "targetHeatTemperature": 23.0,
++                "setpointMode": "PermanentOverride"
++              },
++              "name": "THERMOSTAT",
++              "fanStatus": {
++                "fanMode": "Auto",
++                "canBeChanged": true
++              }
++            }
++          ],
++          "activeFaults": [],
++          "systemModeStatus": {
++            "mode": "Off",
++            "isPermanent": true
++          }
++        }
++      ],
++      "activeFaults": []
++    }
++  ]
++}
